@@ -28,6 +28,7 @@ namespace {
   constexpr auto kLoginManagerInterface = "org.freedesktop.login1.Manager";
 
   constexpr int kMaxRetries = 3;
+  constexpr int kMaxFailedMatches = 3;
   constexpr auto kRetryDelay = std::chrono::milliseconds(250);
 
   enum class MatchResult {
@@ -95,6 +96,8 @@ void FingerprintAuthenticator::setAuthenticatedCallback(AuthenticatedCallback ca
 }
 
 void FingerprintAuthenticator::setStatusCallback(StatusCallback callback) { m_onStatus = std::move(callback); }
+
+void FingerprintAuthenticator::resetAttempts() { m_failedMatches = 0; }
 
 void FingerprintAuthenticator::start() {
   if (m_active) {
@@ -196,7 +199,7 @@ void FingerprintAuthenticator::claimDevice() {
 }
 
 void FingerprintAuthenticator::startVerify(bool isRetry) {
-  if (!m_active || m_sleeping || m_abort) {
+  if (!m_active || m_sleeping || m_abort || m_failedMatches >= kMaxFailedMatches) {
     return;
   }
   m_verifying = true;
@@ -273,7 +276,7 @@ void FingerprintAuthenticator::releaseDevice() {
 }
 
 void FingerprintAuthenticator::handleVerifyStatus(const std::string& result, bool done) {
-  if (!m_active) {
+  if (!m_active || m_failedMatches >= kMaxFailedMatches) {
     return;
   }
   if (m_sleeping) {
@@ -299,9 +302,12 @@ void FingerprintAuthenticator::handleVerifyStatus(const std::string& result, boo
     authenticated = true;
     break;
   case MatchResult::NoMatch:
+    if (!done || !m_verifying) {
+      return;
+    }
     stopVerify();
     ownsRestart = true;
-    if (m_retries >= kMaxRetries) {
+    if (++m_failedMatches >= kMaxFailedMatches) {
       emitStatus(i18n::tr("auth.fingerprint.too-many-attempts"), true);
     } else {
       emitStatus(i18n::tr("auth.fingerprint.no-match"), true);

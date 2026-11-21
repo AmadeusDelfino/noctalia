@@ -26,6 +26,7 @@ public:
   void setAuthenticatedCallback(AuthenticatedCallback callback);
   void setStatusCallback(StatusCallback callback);
 
+  void resetAttempts();
   void start();
   void stop();
 
@@ -54,4 +55,5 @@ private:
   bool m_abort = false;
   bool m_reclaimAttempted = false;
   int m_retries = 0;
+  int m_failedMatches = 0;
 };
