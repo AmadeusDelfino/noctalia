@@ -1,6 +1,7 @@
 #include "auth/fingerprint_authenticator.h"
 #include "core/timer_manager.h"
 #include "dbus/system_bus.h"
+#include "i18n/i18n.h"
 #include "tests/test_check.h"
 
 #include <algorithm>
@@ -8,8 +9,10 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <print>
 #include <sdbus-c++/sdbus-c++.h>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -177,6 +180,173 @@ namespace {
     TEST_CHECK(fake.owner() == self);
   }
 
+  class AttemptFixture {
+  public:
+    AttemptFixture() {
+      m_auth.setStatusCallback([this](const std::string& message, bool error) {
+        m_statuses.emplace_back(message, error);
+      });
+    }
+
+    void start() {
+      m_auth.start();
+      // The device discovery prompt is synchronous. The next ready status acknowledges VerifyStart.
+      waitForReady();
+      TEST_CHECK(m_fake.owner() == m_self);
+    }
+
+    void stop() {
+      m_auth.stop();
+      TEST_CHECK(m_fake.owner().empty());
+    }
+
+    void startWithoutWaiting() { m_auth.start(); }
+
+    void resetAttempts() { m_auth.resetAttempts(); }
+
+    void match() {
+      bool authenticated = false;
+      m_auth.setAuthenticatedCallback([&authenticated] { authenticated = true; });
+      m_fake.emitVerifyStatus("verify-match", true);
+      drainUntil(m_bus, [&] { return authenticated; });
+      m_auth.setAuthenticatedCallback({});
+    }
+
+    long requests() const { return m_fake.calls("VerifyStart", m_self); }
+
+    void waitForReady() { expectNextStatus(m_statuses.size(), "auth.fingerprint.ready", false); }
+
+    void mismatch(std::string_view expected) { verifyStatus("verify-no-match", true, expected, true); }
+
+    void verifyStatus(const std::string& result, bool done, std::string_view key, bool error) {
+      expectStatus(sendStatus(result, done), key, error);
+    }
+
+    void exhaust() {
+      // Establish a depleted budget independently of the exact limit test.
+      for (int attempt = 0; attempt < 4; ++attempt) {
+        const auto status = sendStatus("verify-no-match", true);
+        if (status == std::pair(i18n::tr("auth.fingerprint.too-many-attempts"), true)) {
+          return;
+        }
+        expectStatus(status, "auth.fingerprint.no-match", true);
+        waitForReady();
+      }
+      noctalia::test::failCheck("fingerprint budget was not exhausted");
+    }
+
+    std::pair<std::string, bool> sendStatus(const std::string& result, bool done) {
+      const auto before = m_statuses.size();
+      m_fake.emitVerifyStatus(result, done);
+      return nextStatus(before);
+    }
+
+    void expectNoNewRequests(long expected) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+      do {
+        pump(m_bus);
+        expectRequests(expected);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      } while (std::chrono::steady_clock::now() < deadline);
+      pump(m_bus);
+      expectRequests(expected);
+    }
+
+  private:
+    void expectRequests(long expected) const {
+      const auto observed = requests();
+      if (observed != expected) {
+        std::println(stderr, "VerifyStart requests: got {}, expected {}", observed, expected);
+        TEST_CHECK(observed == expected);
+      }
+    }
+
+    static void expectStatus(const std::pair<std::string, bool>& status, std::string_view key, bool error) {
+      const auto expected = i18n::tr(key);
+      if (status != std::pair(expected, error)) {
+        std::println(
+            stderr, "Fingerprint status: got '{}' (error={}), expected '{}' (error={})", status.first, status.second,
+            expected, error
+        );
+        TEST_CHECK(status == std::pair(expected, error));
+      }
+    }
+
+    std::pair<std::string, bool> nextStatus(std::size_t before) {
+      drainUntil(m_bus, [&] { return m_statuses.size() > before; });
+      return m_statuses[before];
+    }
+
+    void expectNextStatus(std::size_t before, std::string_view key, bool error) {
+      expectStatus(nextStatus(before), key, error);
+    }
+
+    FakeFprintd m_fake;
+    SystemBus m_bus;
+    const std::string m_self = m_bus.connection().getUniqueName();
+    std::vector<std::pair<std::string, bool>> m_statuses;
+    FingerprintAuthenticator m_auth{m_bus};
+  };
+
+  void thirdMismatchExhaustsAttempts() {
+    AttemptFixture fixture;
+    fixture.start();
+    fixture.mismatch("auth.fingerprint.no-match");
+    fixture.waitForReady();
+    fixture.mismatch("auth.fingerprint.no-match");
+    fixture.waitForReady();
+    fixture.mismatch("auth.fingerprint.too-many-attempts");
+    fixture.expectNoNewRequests(3);
+  }
+
+  void stoppedReadingDoesNotRestoreOrConsumeAttempts() {
+    AttemptFixture fixture;
+    fixture.start();
+    fixture.mismatch("auth.fingerprint.no-match");
+    fixture.waitForReady();
+    fixture.mismatch("auth.fingerprint.no-match");
+    fixture.waitForReady();
+    fixture.stop(); // Cancel an armed reading without receiving a result.
+    fixture.start();
+    fixture.mismatch("auth.fingerprint.too-many-attempts");
+    fixture.expectNoNewRequests(4);
+  }
+
+  void exhaustedAuthenticatorDoesNotRestart() {
+    AttemptFixture fixture;
+    fixture.start();
+    fixture.exhaust();
+    const auto before = fixture.requests();
+    fixture.stop();
+    fixture.startWithoutWaiting();
+    fixture.expectNoNewRequests(before);
+  }
+
+  void newLockRestoresAttemptsOnSameAuthenticator() {
+    AttemptFixture fixture;
+    fixture.start();
+    fixture.exhaust();
+    fixture.stop();          // The screen releases the device when unlocking.
+    fixture.resetAttempts(); // The next confirmed lock resets the same authenticator.
+    fixture.start();
+    fixture.match();
+    fixture.stop();
+  }
+
+  void technicalErrorAndScanGuidanceDoNotConsumeMismatchAttempts() {
+    AttemptFixture fixture;
+    fixture.start();
+    fixture.verifyStatus("verify-unknown-error", true, "auth.fingerprint.error", true);
+    fixture.waitForReady();
+    fixture.verifyStatus("verify-retry-scan", false, "auth.fingerprint.retry", false);
+    fixture.mismatch("auth.fingerprint.no-match");
+    fixture.waitForReady();
+    fixture.mismatch("auth.fingerprint.no-match");
+    fixture.waitForReady();
+    fixture.mismatch("auth.fingerprint.too-many-attempts");
+    fixture.expectNoNewRequests(4);
+  }
+
   void disconnectedVerifyReleasesClaimOnStop() {
     FakeFprintd fake;
     SystemBus bus;
@@ -289,5 +459,10 @@ int main() {
   foreignClaimIsLeftAlone();
   stopAfterDeviceRemovalIsBounded();
   stopAfterServiceExitIsBounded();
+  thirdMismatchExhaustsAttempts();
+  stoppedReadingDoesNotRestoreOrConsumeAttempts();
+  exhaustedAuthenticatorDoesNotRestart();
+  newLockRestoresAttemptsOnSameAuthenticator();
+  technicalErrorAndScanGuidanceDoNotConsumeMismatchAttempts();
   return 0;
 }
